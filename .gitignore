@@ -1,0 +1,22 @@
+.venv/
+.runtime/
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+tmp/
+user_sessions/
+user_data/
+*.log.tmp
+reports/
+
+build/
+dist/
+
+# Секреты и личные настройки не должны попадать в публичный репозиторий.
+.env
+.env.*
+*.key
+*.pem
+*.pfx
+*.p12

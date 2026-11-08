@@ -1,0 +1,618 @@
+"""Оконный сценарий. Все обращения к Tk выполняются в основном потоке.
+
+Длительные операции передают результат через очередь; обработка моделей и запись
+не запускаются при создании окна. Микрофон включается только кнопкой пользователя.
+"""
+from __future__ import annotations
+
+from datetime import datetime
+import logging
+import os
+from pathlib import Path
+import queue
+import sys
+import threading
+import time
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from typing import Any, Callable
+
+from .model import AppError, Document
+from .providers import ASRRecognizer, MODELS, MODEL_BY_ID, default_model_id
+from .recording import AudioRecorder
+from .session import Session
+from .storage import export_text
+
+
+class AudioApp:
+    """GUI над публичными операциями Session; зависимости можно передать явно."""
+
+    def __init__(self, root: tk.Tk, project_root: str | Path | None = None,
+                 session: Session | None = None,
+                 recorder: AudioRecorder | None = None,
+                 runtime_root: str | Path | None = None, model_id: str | None = None,
+                 threads: int = 8) -> None:
+        self.root = root
+        default_root = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[1]
+        self.project_root = Path(project_root or default_root)
+        self.runtime_path = Path(runtime_root or os.environ.get("MEDICAL_AUDIO_RUNTIME") or self.project_root / ".runtime")
+        self.threads = threads
+        self._managed_recognizer = session is None
+        model_id = model_id or default_model_id()
+        self.session = session or Session(ASRRecognizer(model_id, self.runtime_path, threads))
+        self.model_name = tk.StringVar(value=MODEL_BY_ID[model_id].label)
+        self._model_map = {item.label: item.id for item in MODELS}
+        self.recorder = recorder or AudioRecorder()
+        self.audio_path: Path | None = None
+        self.session_path: Path | None = None
+        self._busy = False
+        self._closing = False
+        self._close_when_done = False
+        self._loading = False
+        self._rendered_document: Document | None = None
+        self._events: queue.Queue[tuple[Any, ...]] = queue.Queue()
+        self._device_map: dict[str, int | None] = {"Системный микрофон": None}
+        self._record_started = 0.0
+        self.status = tk.StringVar(value="Выберите аудиофайл или начните запись.")
+        self.source = tk.StringVar(value="Аудиофайл не выбран")
+        self.device_name = tk.StringVar(value="Системный микрофон")
+        self.notice = tk.StringVar(value="Расшифровка — черновик. Проверьте слова по исходной записи.")
+        self._build()
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.root.bind("<Control-s>", lambda event: self.save_session())
+        self.root.bind("<Control-o>", lambda event: self.open_session())
+        self.root.bind("<Control-n>", lambda event: self.new_session())
+        self._apply_state()
+        self.root.after(80, self._drain_events)
+
+    def _build(self) -> None:
+        self.root.title("Медицинский аудиомодуль · учебный прототип")
+        self.root.geometry("1180x820")
+        self.root.minsize(940, 650)
+        self.root.configure(background="white")
+        style = ttk.Style(self.root)
+        style.theme_use("clam")
+        style.configure("TFrame", background="white")
+        style.configure("TLabel", background="white", foreground="#17343c", font=("Segoe UI", 10))
+        style.configure("Title.TLabel", font=("Segoe UI", 19, "bold"), foreground="#087e8b")
+        style.configure("Section.TLabel", font=("Segoe UI", 11, "bold"))
+        style.configure("Muted.TLabel", foreground="#516b73", font=("Segoe UI", 9))
+        style.configure("TButton", font=("Segoe UI", 10), padding=(10, 7))
+        style.configure("Accent.TButton", background="#087e8b", foreground="white")
+        style.map("Accent.TButton", background=[("active", "#06616c"), ("disabled", "#dce8ea")],
+                  foreground=[("disabled", "#687e84")])
+        style.configure("Treeview", font=("Segoe UI", 9), rowheight=27,
+                        background="white", fieldbackground="white")
+        style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"))
+
+        outer = ttk.Frame(self.root, padding=(22, 16))
+        outer.grid(sticky="nsew")
+        self.root.rowconfigure(0, weight=1)
+        self.root.columnconfigure(0, weight=1)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(5, weight=1)
+        ttk.Label(outer, text="Запись → расшифровка → проверенный текст", style="Title.TLabel").grid(
+            row=0, column=0, sticky="w")
+        ttk.Label(outer, text="Выберите распознаватель, получите полный текст, исправьте и сохраните результат",
+                  style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 12))
+
+        files = ttk.Frame(outer)
+        files.grid(row=2, column=0, sticky="ew")
+        self.new_button = ttk.Button(files, text="Новый сеанс", command=self.new_session)
+        self.new_button.pack(side="left", padx=(0, 6))
+        self.open_button = ttk.Button(files, text="Открыть сеанс…", command=self.open_session)
+        self.open_button.pack(side="left", padx=(0, 6))
+        self.save_button = ttk.Button(files, text="Сохранить сеанс…", command=lambda: self.save_session(True))
+        self.save_button.pack(side="left", padx=(0, 6))
+        self.export_button = ttk.Button(files, text="Экспорт TXT…", command=self.export_current)
+        self.export_button.pack(side="left", padx=(0, 6))
+        self.protocol_button = ttk.Button(files, text="Протокол осмотра…", command=self.open_protocol)
+        self.protocol_button.pack(side="left")
+
+        audio = ttk.Frame(outer, padding=(0, 12, 0, 8))
+        audio.grid(row=3, column=0, sticky="ew")
+        audio.columnconfigure(1, weight=1)
+        ttk.Label(audio, text="Микрофон:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.device_combo = ttk.Combobox(audio, textvariable=self.device_name, state="readonly",
+                                         values=list(self._device_map))
+        self.device_combo.grid(row=0, column=1, sticky="ew", padx=(0, 6))
+        self.refresh_button = ttk.Button(audio, text="Обновить устройства", command=self.refresh_devices)
+        self.refresh_button.grid(row=0, column=2, padx=(0, 6))
+        self.record_button = ttk.Button(audio, text="Начать запись", command=self.start_recording)
+        self.record_button.grid(row=0, column=3, padx=(0, 6))
+        self.stop_button = ttk.Button(audio, text="Остановить и сохранить…", command=self.stop_recording)
+        self.stop_button.grid(row=0, column=4)
+        self.discard_button = ttk.Button(audio, text="Отменить запись", command=self.discard_recording)
+        self.discard_button.grid(row=1, column=4, sticky="e", pady=(6, 0))
+        self.import_button = ttk.Button(audio, text="Загрузить аудиофайл…", command=self.import_audio)
+        self.import_button.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.process_button = ttk.Button(audio, text="Обработать аудио", style="Accent.TButton",
+                                          command=self.process_audio)
+        self.process_button.grid(row=1, column=2, columnspan=2, sticky="e", padx=(0, 6), pady=(6, 0))
+        ttk.Label(audio, text="Распознаватель:").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.model_combo = ttk.Combobox(audio, textvariable=self.model_name, state="readonly",
+                                        values=list(self._model_map), width=36)
+        self.model_combo.grid(row=2, column=1, columnspan=4, sticky="ew", pady=(8, 0))
+        self.source_label = ttk.Label(outer, textvariable=self.source, style="Muted.TLabel", wraplength=1080)
+        self.source_label.grid(row=4, column=0, sticky="ew", pady=(0, 10))
+
+        panels = ttk.Panedwindow(outer, orient="horizontal")
+        panels.grid(row=5, column=0, sticky="nsew")
+        left = ttk.Frame(panels, padding=(0, 0, 12, 0))
+        right = ttk.Frame(panels, padding=(12, 0, 0, 0))
+        panels.add(left, weight=1)
+        panels.add(right, weight=1)
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(1, weight=1)
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(1, weight=1)
+        ttk.Label(left, text="Исходная транскрипция", style="Section.TLabel").grid(
+            row=0, column=0, sticky="w", pady=(0, 6))
+        self.transcript = self._text(left, row=1, height=16)
+        self.transcript.configure(state="disabled")
+        ttk.Label(left, text="Исходный результат модели сохраняется в сеансе вместе с вашими правками.",
+                  style="Muted.TLabel", wraplength=450).grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        ttk.Label(right, text="Текст после проверки — можно редактировать", style="Section.TLabel").grid(
+            row=0, column=0, sticky="w", pady=(0, 6))
+        self.editor = self._text(right, row=1, height=16)
+        self.editor.bind("<<Modified>>", self._editor_changed)
+        ttk.Label(right, text="TXT содержит текущий текст. JSON позволяет восстановить весь сеанс.",
+                  style="Muted.TLabel", wraplength=450).grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        self.notice_label = ttk.Label(outer, textvariable=self.notice, style="Muted.TLabel", wraplength=1080)
+        self.notice_label.grid(row=6, column=0, sticky="ew", pady=(10, 6))
+        bottom = ttk.Frame(outer)
+        bottom.grid(row=7, column=0, sticky="ew")
+        bottom.columnconfigure(0, weight=1)
+        self.status_label = ttk.Label(bottom, textvariable=self.status, wraplength=880)
+        self.status_label.grid(row=0, column=0, sticky="w")
+        self.progress = ttk.Progressbar(bottom, mode="indeterminate", length=140)
+        self.progress.grid(row=0, column=1, padx=(12, 0))
+        outer.bind("<Configure>", self._resize_labels)
+
+    def _resize_labels(self, event: tk.Event) -> None:
+        width = max(300, event.width - 44)
+        self.source_label.configure(wraplength=width)
+        self.notice_label.configure(wraplength=width)
+        self.status_label.configure(wraplength=max(250, width - 165))
+
+    def _text(self, parent: ttk.Frame, row: int, height: int) -> tk.Text:
+        frame = ttk.Frame(parent)
+        frame.grid(row=row, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        widget = tk.Text(frame, wrap="word", font=("Segoe UI", 11), height=height, width=36,
+                         background="white", foreground="#17343c", insertbackground="#087e8b",
+                         borderwidth=1, relief="solid", padx=10, pady=8, undo=True,
+                         selectbackground="#b8edf0")
+        widget.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=widget.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        widget.configure(yscrollcommand=scrollbar.set)
+        return widget
+
+    def _record_pending(self) -> bool:
+        return self.recorder.status in {"recording", "captured"}
+
+    def _idle(self) -> bool:
+        if self._busy or self._closing:
+            return False
+        if self._record_pending():
+            self.status.set("Сначала сохраните или явно отмените текущую запись.")
+            return False
+        return True
+
+    def _apply_state(self) -> None:
+        recording = self._record_pending()
+        ready = not self._busy and not recording and not self._closing
+        for button in (self.new_button, self.open_button, self.import_button,
+                       self.record_button, self.refresh_button):
+            button.configure(state="normal" if ready else "disabled")
+        self.device_combo.configure(state="readonly" if ready else "disabled")
+        self.model_combo.configure(state="readonly" if ready else "disabled")
+        self.stop_button.configure(state="normal" if recording and not self._busy else "disabled",
+                                   text="Сохранить записанный звук…" if self.recorder.status == "captured"
+                                   else "Остановить и сохранить…")
+        self.discard_button.configure(state="normal" if recording and not self._busy else "disabled")
+        self.process_button.configure(state="normal" if ready and self.audio_path is not None else "disabled")
+        has_result = self.session.document is not None
+        for button in (self.save_button, self.export_button, self.protocol_button):
+            button.configure(state="normal" if ready and has_result else "disabled")
+        self.editor.configure(state="normal" if ready and has_result else "disabled")
+        if self._busy:
+            self.progress.start(12)
+        else:
+            self.progress.stop()
+        self._update_title()
+
+    def _update_title(self) -> None:
+        changed = self.session.document is not None and (self.session.dirty or self.session_path is None)
+        self.root.title(("* " if changed else "") + "Медицинский аудиомодуль · учебный прототип")
+
+    def _submit(self, text: str, operation: Callable[[], Any],
+                success: Callable[[Any], None]) -> None:
+        if self._busy:
+            return
+        self._busy = True
+        self.status.set(text)
+        self._apply_state()
+
+        def worker() -> None:
+            try:
+                result = operation()
+            except Exception as exc:
+                logging.exception("Операция приложения завершилась ошибкой")
+                self._events.put(("error", exc))
+            else:
+                self._events.put(("done", success, result))
+
+        threading.Thread(target=worker, name="audio-processing", daemon=False).start()
+
+    def _drain_events(self) -> None:
+        if self._closing:
+            return
+        try:
+            while True:
+                event = self._events.get_nowait()
+                if event[0] == "status":
+                    self.status.set(event[1])
+                    continue
+                self._busy = False
+                if event[0] == "done":
+                    try:
+                        event[1](event[2])
+                    except Exception as exc:
+                        logging.exception("Ошибка отображения результата")
+                        self._error(exc)
+                else:
+                    self._error(event[1])
+                self._apply_state()
+                if self._close_when_done:
+                    self._close_when_done = False
+                    self.close()
+                    if self._closing:
+                        return
+        except queue.Empty:
+            pass
+        self.root.after(80, self._drain_events)
+
+    def _error(self, exc: Exception) -> None:
+        if self.session.document is not self._rendered_document:
+            self.session_path = None
+            self._render_document(self.session.document)
+        text = str(exc) if isinstance(exc, AppError) else (
+            f"Операция не завершена ({type(exc).__name__}). Данные не удалены; можно повторить попытку.")
+        self.status.set(text)
+        messagebox.showerror("Не удалось выполнить действие", text, parent=self.root)
+
+    def _sync_edits(self) -> None:
+        if self.session.document is not None:
+            self.session.edit(self.editor.get("1.0", "end-1c"))
+
+    def _editor_changed(self, event: tk.Event) -> None:
+        widget = self.editor
+        changed = widget.edit_modified()
+        widget.edit_modified(False)
+        if not changed or self._loading or self._busy or self.session.document is None:
+            return
+        self._sync_edits()
+        self._update_title()
+
+    def _confirm_unsaved(self) -> bool:
+        self._sync_edits()
+        if self.session.document is None or (not self.session.dirty and self.session_path is not None):
+            return True
+        answer = messagebox.askyesnocancel("Результат не сохранён",
+            "Сохранить сеанс с текущими правками перед продолжением?\n"
+            "«Нет» — продолжить без сохранения, «Отмена» — вернуться к результату.", parent=self.root)
+        if answer is None:
+            return False
+        if answer:
+            return self.save_session()
+        # Session запрещает перезаписывать dirty-документ. «Нет» выше является
+        # явным согласием пользователя отказаться от текущего несохранённого результата.
+        self.session.new(force=True)
+        self.session_path = None
+        self._render_document(None)
+        return True
+
+    def _render_document(self, document: Document | None) -> None:
+        self._rendered_document = document
+        self._loading = True
+        try:
+            self.transcript.configure(state="normal")
+            self.transcript.delete("1.0", "end")
+            self.transcript.insert("1.0", document.transcript if document else "")
+            self.transcript.configure(state="disabled")
+            self.editor.configure(state="normal")
+            self.editor.delete("1.0", "end")
+            self.editor.insert("1.0", document.text if document else "")
+            self.editor.edit_reset()
+            self.editor.edit_modified(False)
+            if document:
+                if document.model_id in MODEL_BY_ID:
+                    self.model_name.set(MODEL_BY_ID[document.model_id].label)
+                seconds = document.metrics.get("processing_seconds")
+                timing = f" Обработка: {seconds:.2f} с." if isinstance(seconds, (int, float)) else ""
+                self.notice.set("Проверьте слова по записи. Правки справа не меняют исходное распознавание слева." + timing)
+            else:
+                self.notice.set("Расшифровка — черновик. Проверьте слова по исходной записи.")
+        finally:
+            self._loading = False
+        self._apply_state()
+
+    def new_session(self) -> None:
+        if not self._idle() or not self._confirm_unsaved():
+            return
+        self.session.new(force=True)
+        self.audio_path = None
+        self.session_path = None
+        self.source.set("Аудиофайл не выбран")
+        self._render_document(None)
+        self.status.set("Новый сеанс. Выберите аудиофайл или начните запись.")
+
+    def import_audio(self) -> None:
+        if not self._idle():
+            return
+        selected = filedialog.askopenfilename(title="Выберите аудиозапись диалога", parent=self.root,
+            filetypes=[("Аудиозаписи", "*.wav *.mp3 *.m4a *.flac *.ogg *.mp4 *.mkv"), ("Все файлы", "*.*")])
+        if not selected or not self._confirm_unsaved():
+            return
+        self.session.new(force=True)
+        self.audio_path = Path(selected)
+        self.session_path = None
+        self.source.set("Аудио: " + str(self.audio_path))
+        self._render_document(None)
+        self.status.set("Файл выбран. Нажмите «Обработать аудио».")
+
+    def process_audio(self) -> None:
+        if not self._idle() or self.audio_path is None or not self._confirm_unsaved():
+            return
+        path = self.audio_path
+        self._sync_edits()
+
+        def operation() -> Document:
+            model_id = self._selected_model_id
+            if self._managed_recognizer and model_id != getattr(self.session.recognizer, "model_id", model_id):
+                if hasattr(self.session.recognizer, "close"):
+                    self.session.recognizer.close()
+                self.session.recognizer = ASRRecognizer(model_id, self.runtime_path, self.threads)
+            self._events.put(("status", "Распознавание всего аудиофайла. Дождитесь завершения…"))
+            return self.session.process_file(path)
+
+        def done(document: Document) -> None:
+            self.session_path = None
+            self._render_document(document)
+            self.status.set("Готово. Проверьте и исправьте полный текст справа, затем сохраните результат.")
+
+        self._selected_model_id = self._model_map[self.model_name.get()]
+        self._submit("Подготовка локальной модели. При первом запуске потребуется время…", operation, done)
+
+    def refresh_devices(self) -> None:
+        if not self._idle():
+            return
+
+        def done(devices: list[dict[str, Any]]) -> None:
+            self._device_map = {"Системный микрофон": None}
+            default_name = "Системный микрофон"
+            for item in devices:
+                title = f"{item['index']}: {item['name']}" + (" (по умолчанию)" if item.get("default") else "")
+                self._device_map[title] = item["index"]
+                if item.get("default"):
+                    default_name = title
+            self.device_combo.configure(values=list(self._device_map))
+            self.device_name.set(default_name)
+            self.status.set(f"Найдено устройств записи: {len(devices)}." if devices else
+                            "Микрофоны не найдены. Подключите устройство и обновите список.")
+
+        self._submit("Получение списка микрофонов…", self.recorder.devices, done)
+
+    def start_recording(self) -> None:
+        if not self._idle() or not self._confirm_unsaved():
+            return
+        device = self._device_map.get(self.device_name.get())
+
+        def done(result: Any) -> None:
+            self.session.new(force=True)
+            self.audio_path = None
+            self.session_path = None
+            self._render_document(None)
+            self.source.set("Идёт запись с выбранного микрофона")
+            self._record_started = time.monotonic()
+            self._record_tick()
+
+        self._submit("Включение выбранного микрофона…", lambda: self.recorder.start(device), done)
+
+    def _record_tick(self) -> None:
+        if self._closing or self.recorder.status != "recording":
+            return
+        seconds = int(time.monotonic() - self._record_started)
+        if not self._busy:
+            self.status.set(f"Запись {seconds // 60:02d}:{seconds % 60:02d}. Нажмите «Остановить и сохранить».")
+        self.root.after(1000, self._record_tick)
+
+    def stop_recording(self) -> None:
+        if self._busy or not self._record_pending():
+            return
+        if self.recorder.status == "recording":
+            self._submit("Остановка микрофона…", self.recorder.capture,
+                         lambda result: self._choose_record_path())
+        else:
+            self._choose_record_path()
+
+    def _choose_record_path(self) -> None:
+        # Захват уже остановлен. Отмена выбора пути сохраняет буфер для повтора.
+        self.status.set("Запись остановлена. Выберите место сохранения или отмените запись.")
+        self._apply_state()
+        directory = self.project_root / "user_data" / "recordings"
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self._error(AppError("Не удалось подготовить папку записей. Проверьте права доступа."))
+            return
+        selected = filedialog.asksaveasfilename(title="Сохранить запись WAV", parent=self.root,
+            initialdir=str(directory), initialfile=datetime.now().strftime("dialogue-%Y%m%d-%H%M%S.wav"),
+            defaultextension=".wav", filetypes=[("Запись WAV", "*.wav")])
+        if not selected:
+            return
+
+        def done(path: Path) -> None:
+            self.audio_path = path
+            self.source.set("Запись: " + str(path))
+            warnings = self.recorder.warnings
+            if warnings:
+                self.notice.set("Замечания устройства записи: " + "; ".join(warnings))
+            self.status.set("Запись сохранена. Нажмите «Обработать аудио».")
+
+        self._submit("Остановка микрофона и сохранение WAV…", lambda: self.recorder.stop(selected), done)
+
+    def discard_recording(self) -> None:
+        if self._busy or not self._record_pending():
+            return
+        if not messagebox.askyesno("Отменить запись", "Удалить текущую несохранённую запись?", parent=self.root):
+            return
+
+        def done(result: Any) -> None:
+            self.source.set("Аудиофайл не выбран")
+            self.status.set("Запись отменена. Можно начать новую или загрузить файл.")
+
+        self._submit("Остановка записи…", self.recorder.discard, done)
+
+    def save_session(self, save_as: bool = False) -> bool:
+        if not self._idle() or self.session.document is None:
+            return False
+        self._sync_edits()
+        path = self.session_path
+        if path is None or save_as:
+            selected = filedialog.asksaveasfilename(title="Сохранить сеанс с правками и источниками", parent=self.root,
+                initialfile="dialogue-session.json", defaultextension=".json", filetypes=[("Сеанс JSON", "*.json")])
+            if not selected:
+                return False
+            path = Path(selected)
+        try:
+            self.session.save(path)
+        except Exception as exc:
+            self._error(exc)
+            return False
+        self.session_path = path
+        self._update_title()
+        self.status.set("Сеанс сохранён: " + str(path))
+        return True
+
+    def open_session(self) -> None:
+        if not self._idle():
+            return
+        selected = filedialog.askopenfilename(title="Открыть сохранённый сеанс", parent=self.root,
+            filetypes=[("Сеанс JSON", "*.json"), ("Все файлы", "*.*")])
+        if not selected or not self._confirm_unsaved():
+            return
+        try:
+            document = self.session.open(selected)
+        except Exception as exc:
+            self._error(exc)
+            return
+        self.session_path = Path(selected)
+        source_path = Path(document.source) if document.source else None
+        self.audio_path = source_path if source_path is not None and source_path.is_file() else None
+        self.source.set("Сеанс: " + str(self.session_path) + (" • Аудио: " + document.source if document.source else ""))
+        self._render_document(document)
+        self.status.set("Сеанс открыт. Сохранённые правки восстановлены.")
+
+    def export_current(self) -> None:
+        if not self._idle() or self.session.document is None:
+            return
+        self._sync_edits()
+        selected = filedialog.asksaveasfilename(title="Экспорт текущего текста", parent=self.root,
+            initialfile="dialogue-result.txt", defaultextension=".txt", filetypes=[("Текст UTF-8", "*.txt")])
+        if not selected:
+            return
+        try:
+            export_text(self.session.document, selected)
+        except Exception as exc:
+            self._error(exc)
+            return
+        self.status.set("Текущий текст экспортирован в TXT. Для восстановления сеанса сохраните также JSON.")
+        self._update_title()
+
+    def open_protocol(self, regenerate: bool = False) -> None:
+        from .protocol_gui import ProtocolWindow
+        from .protocol_inference import generate_protocol
+
+        if not self._idle() or self.session.document is None:
+            return
+        self._sync_edits()
+        document = self.session.document
+
+        def changed(draft: dict) -> None:
+            self.session.set_protocol(draft)
+            self._update_title()
+            self.status.set("Протокол изменён. Сохраните сеанс, чтобы восстановить его позже.")
+
+        def show() -> None:
+            ProtocolWindow(self.root, document, changed, lambda: self.open_protocol(regenerate=True))
+
+        if document.protocol is not None and not regenerate:
+            show()
+            return
+        transcript = document.text
+        runtime = Path(os.environ.get("MEDICAL_PROTOCOL_RUNTIME") or self.runtime_path)
+
+        def progress(index: int, total: int) -> None:
+            self._events.put(("status", f"Разметка расшифровки для протокола: фрагмент {index} из {total}."))
+
+        def done(draft: dict) -> None:
+            changed(draft)
+            if not self._close_when_done:
+                show()
+
+        self._submit("Подготовка локальной модели разметки…",
+                     lambda: generate_protocol(transcript, runtime, self.threads, progress), done)
+
+    def close(self) -> None:
+        if self._closing:
+            return
+        if self._busy:
+            if messagebox.askyesno("Операция ещё выполняется",
+                "Закрыть окно после завершения текущей операции?\n"
+                "Перед закрытием можно будет сохранить полученный результат.", parent=self.root):
+                self._close_when_done = True
+                self.status.set("Дождитесь завершения операции. Затем приложение предложит сохранить результат и закроется.")
+            return
+        if self._record_pending():
+            answer = messagebox.askyesnocancel("Есть несохранённая запись",
+                "Сохранить запись перед закрытием?\n«Нет» — удалить несохранённый звук и закрыть окно.", parent=self.root)
+            if answer is None:
+                return
+            if answer:
+                self.stop_recording()
+                self._close_when_done = self._busy
+                return
+            try:
+                self.recorder.discard()
+            except Exception as exc:
+                self._error(exc)
+                return
+        if not self._confirm_unsaved():
+            return
+        self._closing = True
+        self._apply_state()
+        self.root.destroy()
+        if hasattr(self.session.recognizer, "close"):
+            self.session.recognizer.close()
+
+
+MedicalAudioApp = AudioApp
+
+
+def main() -> None:
+    """python -m audio_mvp: создание окна не загружает модели и не пишет звук."""
+    import argparse
+    parser = argparse.ArgumentParser(description="Локальный учебный аудиомодуль ВКР")
+    parser.add_argument("--runtime-path", type=Path, default=None, help="Папка подготовленных ASR-моделей")
+    parser.add_argument("--model", choices=list(MODEL_BY_ID), default=default_model_id())
+    parser.add_argument("--threads", type=int, default=8)
+    args = parser.parse_args()
+    if args.threads < 1:
+        parser.error("число потоков должно быть положительным")
+    root = tk.Tk()
+    AudioApp(root, runtime_root=args.runtime_path, model_id=args.model, threads=args.threads)
+    root.mainloop()
