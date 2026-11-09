@@ -18,10 +18,12 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable
 
 from .model import AppError, Document
-from .providers import ASRRecognizer, MODELS, MODEL_BY_ID, default_model_id
+from .providers import ASRRecognizer, MODEL_BY_ID
 from .recording import AudioRecorder
 from .session import Session
 from .storage import export_text
+
+MVP_MODEL_ID = "gigaam-ctc"
 
 
 class AudioApp:
@@ -37,11 +39,8 @@ class AudioApp:
         self.project_root = Path(project_root or default_root)
         self.runtime_path = Path(runtime_root or os.environ.get("MEDICAL_AUDIO_RUNTIME") or self.project_root / ".runtime")
         self.threads = threads
-        self._managed_recognizer = session is None
-        model_id = model_id or default_model_id()
+        model_id = model_id or MVP_MODEL_ID
         self.session = session or Session(ASRRecognizer(model_id, self.runtime_path, threads))
-        self.model_name = tk.StringVar(value=MODEL_BY_ID[model_id].label)
-        self._model_map = {item.label: item.id for item in MODELS}
         self.recorder = recorder or AudioRecorder()
         self.audio_path: Path | None = None
         self.session_path: Path | None = None
@@ -93,7 +92,7 @@ class AudioApp:
         outer.rowconfigure(5, weight=1)
         ttk.Label(outer, text="Запись → расшифровка → проверенный текст", style="Title.TLabel").grid(
             row=0, column=0, sticky="w")
-        ttk.Label(outer, text="Выберите распознаватель, получите полный текст, исправьте и сохраните результат",
+        ttk.Label(outer, text="Запишите или загрузите аудио, проверьте расшифровку и подготовьте протокол",
                   style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 12))
 
         files = ttk.Frame(outer)
@@ -129,10 +128,6 @@ class AudioApp:
         self.process_button = ttk.Button(audio, text="Обработать аудио", style="Accent.TButton",
                                           command=self.process_audio)
         self.process_button.grid(row=1, column=2, columnspan=2, sticky="e", padx=(0, 6), pady=(6, 0))
-        ttk.Label(audio, text="Распознаватель:").grid(row=2, column=0, sticky="w", pady=(8, 0))
-        self.model_combo = ttk.Combobox(audio, textvariable=self.model_name, state="readonly",
-                                        values=list(self._model_map), width=36)
-        self.model_combo.grid(row=2, column=1, columnspan=4, sticky="ew", pady=(8, 0))
         self.source_label = ttk.Label(outer, textvariable=self.source, style="Muted.TLabel", wraplength=1080)
         self.source_label.grid(row=4, column=0, sticky="ew", pady=(0, 10))
 
@@ -208,7 +203,6 @@ class AudioApp:
                        self.record_button, self.refresh_button):
             button.configure(state="normal" if ready else "disabled")
         self.device_combo.configure(state="readonly" if ready else "disabled")
-        self.model_combo.configure(state="readonly" if ready else "disabled")
         self.stop_button.configure(state="normal" if recording and not self._busy else "disabled",
                                    text="Сохранить записанный звук…" if self.recorder.status == "captured"
                                    else "Остановить и сохранить…")
@@ -329,8 +323,6 @@ class AudioApp:
             self.editor.edit_reset()
             self.editor.edit_modified(False)
             if document:
-                if document.model_id in MODEL_BY_ID:
-                    self.model_name.set(MODEL_BY_ID[document.model_id].label)
                 seconds = document.metrics.get("processing_seconds")
                 timing = f" Обработка: {seconds:.2f} с." if isinstance(seconds, (int, float)) else ""
                 self.notice.set("Проверьте слова по записи. Правки справа не меняют исходное распознавание слева." + timing)
@@ -371,11 +363,6 @@ class AudioApp:
         self._sync_edits()
 
         def operation() -> Document:
-            model_id = self._selected_model_id
-            if self._managed_recognizer and model_id != getattr(self.session.recognizer, "model_id", model_id):
-                if hasattr(self.session.recognizer, "close"):
-                    self.session.recognizer.close()
-                self.session.recognizer = ASRRecognizer(model_id, self.runtime_path, self.threads)
             self._events.put(("status", "Распознавание всего аудиофайла. Дождитесь завершения…"))
             return self.session.process_file(path)
 
@@ -384,7 +371,6 @@ class AudioApp:
             self._render_document(document)
             self.status.set("Готово. Проверьте и исправьте полный текст справа, затем сохраните результат.")
 
-        self._selected_model_id = self._model_map[self.model_name.get()]
         self._submit("Подготовка локальной модели. При первом запуске потребуется время…", operation, done)
 
     def refresh_devices(self) -> None:
@@ -608,7 +594,7 @@ def main() -> None:
     import argparse
     parser = argparse.ArgumentParser(description="Локальный учебный аудиомодуль ВКР")
     parser.add_argument("--runtime-path", type=Path, default=None, help="Папка подготовленных ASR-моделей")
-    parser.add_argument("--model", choices=list(MODEL_BY_ID), default=default_model_id())
+    parser.add_argument("--model", choices=list(MODEL_BY_ID), default=MVP_MODEL_ID, help=argparse.SUPPRESS)
     parser.add_argument("--threads", type=int, default=8)
     args = parser.parse_args()
     if args.threads < 1:

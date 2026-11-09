@@ -10,7 +10,8 @@ import subprocess
 import time
 
 from .model import AppError
-from .protocol import BY_KEY, FIELDS, FORM_TITLE, make_draft, normalize_value
+from .protocol import BY_KEY, FIELDS, FORM_TITLE, is_question as _is_question, make_draft, normalize_value
+from .protocol_review import split_unpunctuated_questions
 
 
 FIELD_IDS = [field.key for field in FIELDS] + ["off_topic"]
@@ -166,22 +167,24 @@ def _response_rows(port, prompt, text, properties):
         raise AppError("Не удалось прочитать разметку локальной модели.") from exc
 
 
-def _is_question(line):
-    return line.endswith("?") or bool(re.match(
-        r"^(?:а\s+)?(?:что|когда|как(?:ой|ая|ие)?|сколько|насколько|где|какие|"
-        r"были ли|есть ли|принимаете ли|на какие)\b", line.lower()))
-
-
 def _explicit_field(line):
     lower = line.lower()
     for key, pattern in (
         ("off_topic", r"\b(?:парковк\w*|гардероб\w*|вайфай)\b"),
+        ("patient_name", r"как вас зовут|назовите.*фамили"),
+        ("birth_date", r"дат[ау] рождения|когда.*родил"),
         ("allergies", r"аллерги|реакци\w*.*(?:лекарств|препарат)|(?:лекарств|препарат).*реакци"),
+        ("implants", r"имплант|кардиостимулятор"),
         ("weight", r"\b(?:вес|масса тела|массе тела)\b"),
         ("height", r"\bрост\b"),
         ("pressure", r"\b(?:давление|ад)\b"),
         ("pulse", r"\b(?:чсс|частота сердечных сокращений)\b"),
-        ("medicines", r"(?:препарат|лекарств).*(?:принима|пь[её]те)|(?:принима|пь[её]те).*(?:препарат|лекарств)"),
+        ("respiratory_rate", r"\b(?:чдд|частота дыхания|дыхательных движений)\b"),
+        ("oxygen_saturation", r"\b(?:сатураци\w*|spo[2₂])\b"),
+        ("heart_sounds", r"\bтоны сердца\b"),
+        ("past_diseases", r"(?:заболеван|болезн).*(?:перенес|перенесли)|чем.*болели"),
+        ("medicines", r"(?:препарат|лекарств|таблет).*(?:принима|пь[её]те)|"
+                      r"(?:принима|пь[её]те).*(?:препарат|лекарств|таблет)"),
         ("illness", r"^(?:а\s+)?(?:когда\b.*(?:появи|нача)|давно\b.*нача)"),
         ("complaints", r"беспокоит|жалуетесь|^(?:а\s+)?насколько\s+сильн"),
     ):
@@ -191,6 +194,8 @@ def _explicit_field(line):
 
 
 def _lines(block):
+    if not re.search(r"[.!?\n]", block):
+        return split_unpunctuated_questions(block)
     lines = []
     for line in re.split(r"(?<=[.!?])\s+|\n+", block):
         line = line.strip()
@@ -228,6 +233,8 @@ def _indexed_labels(port, lines):
             adjacent = lines[question]
             if not _is_question(adjacent) and _explicit_field(adjacent) in (None, key):
                 a = adjacent
+        if q and key in BY_KEY and not _is_question(q) and not re.search(r"\bли\b", q, flags=re.IGNORECASE):
+            q = ""
         result.append({"field": key, "question": q, "answer": a})
 
     for index, line in enumerate(lines):
@@ -252,6 +259,8 @@ def _label(port, block):
         row["field"] = _explicit_field(q) or row["field"]
         if a and ("?" in a or _is_question(a) or (q and q in a)):
             row["answer"] = ""
+        if q and row["field"] in BY_KEY and not _is_question(q) and not re.search(r"\bли\b", q, flags=re.IGNORECASE):
+            row["question"] = ""
     return rows
 
 
