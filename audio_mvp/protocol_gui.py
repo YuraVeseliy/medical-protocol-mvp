@@ -120,12 +120,7 @@ class ProtocolWindow(tk.Toplevel):
         draft = self.document.protocol
         review = review_protocol(draft)
         filled_pct = f"{review.filled_pct:.1f}".replace(".", ",")
-        empty_pct = f"{review.empty_pct:.1f}".replace(".", ",")
-        self.summary.set(
-            f"Заполнено {review.filled} из {review.total} ({filled_pct}%)  ·  "
-            f"Без значения {review.empty} из {review.total} ({empty_pct}%)  ·  "
-            f"Вопросов найдено {review.questions_found} из {review.question_count}"
-        )
+        self.summary.set(f"Заполнено {filled_pct}%")
         notices = [review.question_source]
         if draft["source_text"] != self.document.text:
             notices.append("Расшифровка изменена. Обновите разметку перед экспортом.")
