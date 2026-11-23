@@ -6,7 +6,7 @@ if not exist ".venv\Scripts\python.exe" py -3.12 -m venv .venv
 if errorlevel 1 goto fail
 ".venv\Scripts\python.exe" -m pip install -r requirements.txt -c requirements-lock.txt
 if errorlevel 1 goto fail
-".venv\Scripts\python.exe" scripts\setup_asr_models.py --model whisper-small
+".venv\Scripts\python.exe" scripts\setup_asr_models.py --model gigaam-ctc
 if errorlevel 1 goto fail
 ".venv\Scripts\python.exe" scripts\setup_protocol_runtime.py
 if errorlevel 1 goto fail

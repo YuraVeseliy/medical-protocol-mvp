@@ -7,7 +7,7 @@ if not exist ".venv\Scripts\python.exe" (
     pause
     exit /b 1
 )
-".venv\Scripts\python.exe" -m audio_mvp --model whisper-small %*
+".venv\Scripts\python.exe" -m audio_mvp %*
 if errorlevel 1 (
     pause
     exit /b 1

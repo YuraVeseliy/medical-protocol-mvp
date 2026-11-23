@@ -60,8 +60,8 @@ def load_document(path):
             segments.append(segment)
         protocol = None
         if payload["version"] == 3:
-            from .protocol import check_draft
-            protocol = item["protocol"]
+            from .protocol import check_draft, upgrade_legacy_draft
+            protocol = upgrade_legacy_draft(item["protocol"])
             check_draft(protocol)
         return Document(transcript=item["transcript"], text=item["text"], source=item["source"],
                         model_id=item["model_id"], segments=segments, metrics=item["metrics"], protocol=protocol)

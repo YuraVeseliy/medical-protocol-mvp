@@ -12,33 +12,53 @@ class Field:
     label: str
     kind: str = "text"
     unit: str = ""
-    required: bool = False
 
 
-# Рабочие поля MVP по образцу предоперационного осмотра. Признак required
-# задаёт учебный сценарий проверки, пока обязательность не согласована с ОКБ.
-FORM_ID = "preoperative-anaesthesiology-v1"
-FORM_TITLE = "Предоперационный осмотр анестезиологом-реаниматологом"
+# Поля печатной формы и раздела «Объективный статус» экранного образца.
+FORM_ID = "preoperative-anaesthesiology-v2"
+FORM_TITLE = "Предоперационный осмотр врачом-анестезиологом-реаниматологом"
 FIELDS = (
-    Field("complaints", "Жалобы", required=True),
-    Field("illness", "Анамнез болезни", required=True),
+    Field("patient_name", "Пациент"),
+    Field("chart_number", "№ карты"),
+    Field("birth_date", "Дата рождения"),
+    Field("sex", "Пол"),
+    Field("exam_date", "Дата осмотра"),
+    Field("complaints", "Жалобы"),
+    Field("illness", "Анамнез болезни"),
     Field("life", "Анамнез жизни"),
     Field("medicines", "Принимаемые препараты"),
     Field("implants", "Имплантированные устройства"),
-    Field("allergies", "Аллергологический анамнез", required=True),
+    Field("allergies", "Аллергологический анамнез"),
     Field("objective", "Объективный статус"),
     Field("weight", "Масса тела", "number", "кг"),
     Field("height", "Рост", "number", "см"),
-    Field("pulse", "ЧСС", "number", "уд/мин"),
+    Field("patient_condition", "Состояние пациента"),
+    Field("skin", "Кожные покровы"),
+    Field("edema_cyanosis", "Отёки и цианоз"),
+    Field("breathing", "Дыхание"),
+    Field("respiratory_rate", "ЧДД", "number", "в мин"),
+    Field("oxygen_saturation", "SpO₂", "number", "%"),
+    Field("heart_sounds", "Тоны сердца"),
     Field("pressure", "Артериальное давление", "pressure", "мм рт. ст."),
+    Field("pulse", "ЧСС", "number", "уд/мин"),
+    Field("tongue", "Язык"),
+    Field("abdomen", "Живот"),
+    Field("past_diseases", "Перенесённые заболевания"),
     Field("tests", "Результаты исследований"),
     Field("mallampati", "Класс по Mallampati", "class"),
     Field("conclusion", "Заключение"),
+    Field("assessment_scales", "Значения оценочных шкал"),
     Field("procedure", "Область вмешательства"),
     Field("anaesthesia", "Предполагаемый метод анестезии"),
     Field("manipulations", "Предполагаемые манипуляции"),
 )
 BY_KEY = {field.key: field for field in FIELDS}
+LEGACY_FORM_ID = "preoperative-anaesthesiology-v1"
+LEGACY_KEYS = frozenset((
+    "complaints", "illness", "life", "medicines", "implants", "allergies", "objective", "weight",
+    "height", "pulse", "pressure", "tests", "mallampati", "conclusion", "procedure", "anaesthesia",
+    "manipulations",
+))
 STATUS_LABELS = {
     "missing": "Нет сведений",
     "unanswered": "Вопрос без ответа",
@@ -46,6 +66,12 @@ STATUS_LABELS = {
     "filled": "Черновик заполнен",
     "edited": "Внесено вручную",
 }
+QUESTION_START = re.compile(
+    r"^(?:а\s+)?(?:что|когда|как(?:ой|ая|ие|овы)?|сколько|насколько|где|какие|чем|"
+    r"были ли|была ли|было ли|есть ли|принимаете ли|на какие|на что|давно ли|"
+    r"назовите|укажите)\b",
+    re.IGNORECASE,
+)
 NUMBER_WORDS = dict(zip(
     "ноль один два три четыре пять шесть семь восемь девять десять одиннадцать двенадцать "
     "тринадцать четырнадцать пятнадцать шестнадцать семнадцать восемнадцать девятнадцать "
@@ -53,6 +79,10 @@ NUMBER_WORDS = dict(zip(
     "сто двести триста четыреста пятьсот шестьсот семьсот восемьсот девятьсот".split(),
     (*range(20), *range(20, 100, 10), *range(100, 1000, 100)),
 ))
+
+
+def is_question(text):
+    return text.rstrip().endswith("?") or bool(QUESTION_START.match(text.lstrip()))
 
 
 def _numbers(value):
@@ -105,7 +135,9 @@ def normalize_value(field, value):
     if (field.key == "height" and re.search(r"\b(?:м|метр\w*|мм|миллиметр\w*)\b", value.lower())
             or field.key == "weight" and re.search(r"\b(?:г|грамм\w*|фунт\w*)\b", value.lower())):
         return ""
-    if number <= 0 or (field.key == "pulse" and number != number.to_integral_value()):
+    if number <= 0 or (field.key in {"pulse", "respiratory_rate"} and number != number.to_integral_value()):
+        return ""
+    if field.key == "oxygen_saturation" and number > 100:
         return ""
     return format(number.normalize(), "f").replace(".", ",")
 
@@ -195,8 +227,27 @@ def check_draft(draft):
         raise ValueError("Некорректные сведения о разметке")
 
 
+def upgrade_legacy_draft(draft):
+    """Добавляет новые пустые поля к существующему сеансу старой формы."""
+    if not isinstance(draft, dict) or draft.get("form") != LEGACY_FORM_ID:
+        return draft
+    fields = draft.get("fields")
+    if not isinstance(fields, dict) or set(fields) != LEGACY_KEYS:
+        raise ValueError("Неизвестные поля старой формы")
+    return {
+        **draft,
+        "form": FORM_ID,
+        "fields": {
+            field.key: fields[field.key] if field.key in fields else {
+                "value": "", "status": "missing", "evidence": [],
+            }
+            for field in FIELDS
+        },
+    }
+
+
 def incomplete_required(draft):
-    return [field.label for field in FIELDS if field.required and not draft["fields"][field.key]["value"]]
+    return [field.label for field in FIELDS if not draft["fields"][field.key]["value"]]
 
 
 def set_field_value(draft, key, value):

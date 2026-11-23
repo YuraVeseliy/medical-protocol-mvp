@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from audio_mvp.gui import AudioApp
 from audio_mvp.model import Segment
-from audio_mvp.providers import ASRRecognizer, MODEL_BY_ID
+from audio_mvp.providers import MODEL_BY_ID
 from audio_mvp.provenance import source_version
 from audio_mvp.session import Session
 
@@ -35,8 +35,7 @@ def main():
     root = tk.Tk()
     root.withdraw()
     if args.model:
-        app = AudioApp(root, project_root=ROOT, runtime_root=args.runtime)
-        app.model_name.set(MODEL_BY_ID[args.model].label)
+        app = AudioApp(root, project_root=ROOT, runtime_root=args.runtime, model_id=args.model)
     else:
         app = AudioApp(root, session=Session(ExternalRecognizer()), project_root=ROOT)
     session = app.session
@@ -58,7 +57,6 @@ def main():
         if args.model:
             assert session.document.model_id == args.model
         assert original and app.transcript.get('1.0', 'end-1c') == original
-        assert len(app.model_combo['values']) == 8
         edited = original + '\nПроверка сохранения: тестовая правка.'
         app.editor.delete('1.0', 'end')
         app.editor.insert('1.0', edited)

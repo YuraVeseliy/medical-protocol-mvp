@@ -26,7 +26,7 @@ def main():
     print(output)
     report = {"time_utc": datetime.now(timezone.utc).isoformat(), **source_version(ROOT), "python": sys.version,
               "platform": platform.platform(), "executed_by": "automatic unittest runner",
-              "scope": "public transcription operations, file IO, full audio coverage, WER example and recording stop; external ASR/device doubles, not model accuracy",
+              "scope": "audio import UI, transcription operations, protocol, file IO, full audio coverage and WER example; external ASR doubles",
               "run": result.testsRun, "failures": len(result.failures), "errors": len(result.errors),
               "skipped": len(result.skipped), "successful": result.wasSuccessful()}
     target = args.out
