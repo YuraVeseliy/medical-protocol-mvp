@@ -1,25 +1,22 @@
 """Оконный сценарий. Все обращения к Tk выполняются в основном потоке.
 
-Длительные операции передают результат через очередь; обработка моделей и запись
-не запускаются при создании окна. Микрофон включается только кнопкой пользователя.
+Длительные операции передают результат через очередь. Распознавание начинается
+после выбора аудиофайла и команды пользователя.
 """
 from __future__ import annotations
 
-from datetime import datetime
 import logging
 import os
 from pathlib import Path
 import queue
 import sys
 import threading
-import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable
 
 from .model import AppError, Document
 from .providers import ASRRecognizer, MODEL_BY_ID
-from .recording import AudioRecorder
 from .session import Session
 from .storage import export_text
 
@@ -31,7 +28,6 @@ class AudioApp:
 
     def __init__(self, root: tk.Tk, project_root: str | Path | None = None,
                  session: Session | None = None,
-                 recorder: AudioRecorder | None = None,
                  runtime_root: str | Path | None = None, model_id: str | None = None,
                  threads: int = 8) -> None:
         self.root = root
@@ -41,7 +37,6 @@ class AudioApp:
         self.threads = threads
         model_id = model_id or MVP_MODEL_ID
         self.session = session or Session(ASRRecognizer(model_id, self.runtime_path, threads))
-        self.recorder = recorder or AudioRecorder()
         self.audio_path: Path | None = None
         self.session_path: Path | None = None
         self._busy = False
@@ -50,11 +45,8 @@ class AudioApp:
         self._loading = False
         self._rendered_document: Document | None = None
         self._events: queue.Queue[tuple[Any, ...]] = queue.Queue()
-        self._device_map: dict[str, int | None] = {"Системный микрофон": None}
-        self._record_started = 0.0
-        self.status = tk.StringVar(value="Выберите аудиофайл или начните запись.")
+        self.status = tk.StringVar(value="Загрузите аудиофайл с записью разговора.")
         self.source = tk.StringVar(value="Аудиофайл не выбран")
-        self.device_name = tk.StringVar(value="Системный микрофон")
         self.notice = tk.StringVar(value="Расшифровка — черновик. Проверьте слова по исходной записи.")
         self._build()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
@@ -90,9 +82,9 @@ class AudioApp:
         self.root.columnconfigure(0, weight=1)
         outer.columnconfigure(0, weight=1)
         outer.rowconfigure(5, weight=1)
-        ttk.Label(outer, text="Запись → расшифровка → проверенный текст", style="Title.TLabel").grid(
+        ttk.Label(outer, text="Аудиофайл → расшифровка → проверенный текст", style="Title.TLabel").grid(
             row=0, column=0, sticky="w")
-        ttk.Label(outer, text="Запишите или загрузите аудио, проверьте расшифровку и подготовьте протокол",
+        ttk.Label(outer, text="Загрузите запись, проверьте расшифровку и подготовьте протокол",
                   style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 12))
 
         files = ttk.Frame(outer)
@@ -110,24 +102,11 @@ class AudioApp:
 
         audio = ttk.Frame(outer, padding=(0, 12, 0, 8))
         audio.grid(row=3, column=0, sticky="ew")
-        audio.columnconfigure(1, weight=1)
-        ttk.Label(audio, text="Микрофон:").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        self.device_combo = ttk.Combobox(audio, textvariable=self.device_name, state="readonly",
-                                         values=list(self._device_map))
-        self.device_combo.grid(row=0, column=1, sticky="ew", padx=(0, 6))
-        self.refresh_button = ttk.Button(audio, text="Обновить устройства", command=self.refresh_devices)
-        self.refresh_button.grid(row=0, column=2, padx=(0, 6))
-        self.record_button = ttk.Button(audio, text="Начать запись", command=self.start_recording)
-        self.record_button.grid(row=0, column=3, padx=(0, 6))
-        self.stop_button = ttk.Button(audio, text="Остановить и сохранить…", command=self.stop_recording)
-        self.stop_button.grid(row=0, column=4)
-        self.discard_button = ttk.Button(audio, text="Отменить запись", command=self.discard_recording)
-        self.discard_button.grid(row=1, column=4, sticky="e", pady=(6, 0))
         self.import_button = ttk.Button(audio, text="Загрузить аудиофайл…", command=self.import_audio)
-        self.import_button.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.import_button.pack(side="left", padx=(0, 6))
         self.process_button = ttk.Button(audio, text="Обработать аудио", style="Accent.TButton",
                                           command=self.process_audio)
-        self.process_button.grid(row=1, column=2, columnspan=2, sticky="e", padx=(0, 6), pady=(6, 0))
+        self.process_button.pack(side="left")
         self.source_label = ttk.Label(outer, textvariable=self.source, style="Muted.TLabel", wraplength=1080)
         self.source_label.grid(row=4, column=0, sticky="ew", pady=(0, 10))
 
@@ -185,28 +164,13 @@ class AudioApp:
         widget.configure(yscrollcommand=scrollbar.set)
         return widget
 
-    def _record_pending(self) -> bool:
-        return self.recorder.status in {"recording", "captured"}
-
     def _idle(self) -> bool:
-        if self._busy or self._closing:
-            return False
-        if self._record_pending():
-            self.status.set("Сначала сохраните или явно отмените текущую запись.")
-            return False
-        return True
+        return not self._busy and not self._closing
 
     def _apply_state(self) -> None:
-        recording = self._record_pending()
-        ready = not self._busy and not recording and not self._closing
-        for button in (self.new_button, self.open_button, self.import_button,
-                       self.record_button, self.refresh_button):
+        ready = self._idle()
+        for button in (self.new_button, self.open_button, self.import_button):
             button.configure(state="normal" if ready else "disabled")
-        self.device_combo.configure(state="readonly" if ready else "disabled")
-        self.stop_button.configure(state="normal" if recording and not self._busy else "disabled",
-                                   text="Сохранить записанный звук…" if self.recorder.status == "captured"
-                                   else "Остановить и сохранить…")
-        self.discard_button.configure(state="normal" if recording and not self._busy else "disabled")
         self.process_button.configure(state="normal" if ready and self.audio_path is not None else "disabled")
         has_result = self.session.document is not None
         for button in (self.save_button, self.export_button, self.protocol_button):
@@ -340,7 +304,7 @@ class AudioApp:
         self.session_path = None
         self.source.set("Аудиофайл не выбран")
         self._render_document(None)
-        self.status.set("Новый сеанс. Выберите аудиофайл или начните запись.")
+        self.status.set("Новый сеанс. Загрузите аудиофайл.")
 
     def import_audio(self) -> None:
         if not self._idle():
@@ -372,96 +336,6 @@ class AudioApp:
             self.status.set("Готово. Проверьте и исправьте полный текст справа, затем сохраните результат.")
 
         self._submit("Подготовка локальной модели. При первом запуске потребуется время…", operation, done)
-
-    def refresh_devices(self) -> None:
-        if not self._idle():
-            return
-
-        def done(devices: list[dict[str, Any]]) -> None:
-            self._device_map = {"Системный микрофон": None}
-            default_name = "Системный микрофон"
-            for item in devices:
-                title = f"{item['index']}: {item['name']}" + (" (по умолчанию)" if item.get("default") else "")
-                self._device_map[title] = item["index"]
-                if item.get("default"):
-                    default_name = title
-            self.device_combo.configure(values=list(self._device_map))
-            self.device_name.set(default_name)
-            self.status.set(f"Найдено устройств записи: {len(devices)}." if devices else
-                            "Микрофоны не найдены. Подключите устройство и обновите список.")
-
-        self._submit("Получение списка микрофонов…", self.recorder.devices, done)
-
-    def start_recording(self) -> None:
-        if not self._idle() or not self._confirm_unsaved():
-            return
-        device = self._device_map.get(self.device_name.get())
-
-        def done(result: Any) -> None:
-            self.session.new(force=True)
-            self.audio_path = None
-            self.session_path = None
-            self._render_document(None)
-            self.source.set("Идёт запись с выбранного микрофона")
-            self._record_started = time.monotonic()
-            self._record_tick()
-
-        self._submit("Включение выбранного микрофона…", lambda: self.recorder.start(device), done)
-
-    def _record_tick(self) -> None:
-        if self._closing or self.recorder.status != "recording":
-            return
-        seconds = int(time.monotonic() - self._record_started)
-        if not self._busy:
-            self.status.set(f"Запись {seconds // 60:02d}:{seconds % 60:02d}. Нажмите «Остановить и сохранить».")
-        self.root.after(1000, self._record_tick)
-
-    def stop_recording(self) -> None:
-        if self._busy or not self._record_pending():
-            return
-        if self.recorder.status == "recording":
-            self._submit("Остановка микрофона…", self.recorder.capture,
-                         lambda result: self._choose_record_path())
-        else:
-            self._choose_record_path()
-
-    def _choose_record_path(self) -> None:
-        # Захват уже остановлен. Отмена выбора пути сохраняет буфер для повтора.
-        self.status.set("Запись остановлена. Выберите место сохранения или отмените запись.")
-        self._apply_state()
-        directory = self.project_root / "user_data" / "recordings"
-        try:
-            directory.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            self._error(AppError("Не удалось подготовить папку записей. Проверьте права доступа."))
-            return
-        selected = filedialog.asksaveasfilename(title="Сохранить запись WAV", parent=self.root,
-            initialdir=str(directory), initialfile=datetime.now().strftime("dialogue-%Y%m%d-%H%M%S.wav"),
-            defaultextension=".wav", filetypes=[("Запись WAV", "*.wav")])
-        if not selected:
-            return
-
-        def done(path: Path) -> None:
-            self.audio_path = path
-            self.source.set("Запись: " + str(path))
-            warnings = self.recorder.warnings
-            if warnings:
-                self.notice.set("Замечания устройства записи: " + "; ".join(warnings))
-            self.status.set("Запись сохранена. Нажмите «Обработать аудио».")
-
-        self._submit("Остановка микрофона и сохранение WAV…", lambda: self.recorder.stop(selected), done)
-
-    def discard_recording(self) -> None:
-        if self._busy or not self._record_pending():
-            return
-        if not messagebox.askyesno("Отменить запись", "Удалить текущую несохранённую запись?", parent=self.root):
-            return
-
-        def done(result: Any) -> None:
-            self.source.set("Аудиофайл не выбран")
-            self.status.set("Запись отменена. Можно начать новую или загрузить файл.")
-
-        self._submit("Остановка записи…", self.recorder.discard, done)
 
     def save_session(self, save_as: bool = False) -> bool:
         if not self._idle() or self.session.document is None:
@@ -563,20 +437,6 @@ class AudioApp:
                 self._close_when_done = True
                 self.status.set("Дождитесь завершения операции. Затем приложение предложит сохранить результат и закроется.")
             return
-        if self._record_pending():
-            answer = messagebox.askyesnocancel("Есть несохранённая запись",
-                "Сохранить запись перед закрытием?\n«Нет» — удалить несохранённый звук и закрыть окно.", parent=self.root)
-            if answer is None:
-                return
-            if answer:
-                self.stop_recording()
-                self._close_when_done = self._busy
-                return
-            try:
-                self.recorder.discard()
-            except Exception as exc:
-                self._error(exc)
-                return
         if not self._confirm_unsaved():
             return
         self._closing = True
@@ -590,7 +450,7 @@ MedicalAudioApp = AudioApp
 
 
 def main() -> None:
-    """python -m audio_mvp: создание окна не загружает модели и не пишет звук."""
+    """Точка входа в графическое приложение."""
     import argparse
     parser = argparse.ArgumentParser(description="Локальный учебный аудиомодуль ВКР")
     parser.add_argument("--runtime-path", type=Path, default=None, help="Папка подготовленных ASR-моделей")

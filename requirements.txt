@@ -1,7 +1,6 @@
 # Python 3.12 x64: проверенная конфигурация Windows CPU
 setuptools==80.9.0
 faster-whisper==1.2.1
-sounddevice==0.5.3
 soundfile==0.13.1
 huggingface-hub==0.36.0
 numpy==2.2.6
